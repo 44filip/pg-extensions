@@ -37,10 +37,7 @@
     db_mode: "auto"
     db_exclude_regex: "^(template0|template1|postgres)$"
     database_names: ""
-
-    # org-specific repo prefix - override per environment
-    repo_custom_prefix: "EXAMPLE"
-
+    
     # add new extensions here, using package names and SQL extension names
     pg_extensions:
       postgis:
