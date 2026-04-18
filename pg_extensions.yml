@@ -1,0 +1,285 @@
+- name: "[ DB | PG | Extensions ] Detect Reachable Hosts"
+  hosts: "{{ vmname }}"
+  gather_facts: no
+  become: yes
+  vars:
+    ansible_ssh_user: ansiblemgr
+
+  tasks:
+    - block:
+        - name: Check SSH connectivity
+          ansible.builtin.wait_for_connection:
+            timeout: 5
+          vars:
+            ansible_connection: ssh
+
+        - name: Add reachable hosts to dynamic group
+          ansible.builtin.group_by:
+            key: "running_hosts"
+      rescue:
+        - name: Host unreachable
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} is unreachable"
+
+
+- name: "[ DB | PG | Extensions ] Apply Remediation"
+  hosts: running_hosts
+  gather_facts: yes
+  become: yes
+  ignore_unreachable: yes
+
+  vars:
+    ansible_ssh_user: ansiblemgr
+    # which extensions to install - passed from AWX survey/extra vars
+    pg_extensions_enabled: []
+    native_pg_extensions_enabled: []
+
+    db_mode: "auto"
+    db_exclude_regex: "^(template0|template1|postgres)$"
+    database_names: ""
+
+    # org-specific repo prefix - override per environment
+    repo_custom_prefix: "EXAMPLE"
+
+    # add new extensions here, using package names and SQL extension names
+    pg_extensions:
+      postgis:
+        packages: ["postgis", "postgis-client", "postgis-utils"]
+        sql_name: "postgis"
+
+      pgvector:
+        packages: ["pgvector_{{ postgres_number_version }}"]
+        sql_name: "vector"
+
+    native_pg_extensions:
+      hstore:
+        sql_name: "hstore"
+
+      btree_gist:
+        sql_name: "btree_gist"
+
+  pre_tasks:
+    - name: Assert RHEL >= 8
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'RedHat'
+          - (ansible_facts['distribution_major_version'] | int) >= 8
+        fail_msg: "This play supports only RHEL >= 8."
+
+    - name: Normalize extension inputs to lists
+      ansible.builtin.set_fact:
+        pg_extensions_list: >-
+          {{
+            (pg_extensions_enabled is sequence and pg_extensions_enabled is not string)
+            | ternary(pg_extensions_enabled, (pg_extensions_enabled | default('') | string | split(',')))
+            | map('trim') | reject('equalto','') | list
+          }}
+        native_pg_extensions_list: >-
+          {{
+            (native_pg_extensions_enabled is sequence and native_pg_extensions_enabled is not string)
+            | ternary(native_pg_extensions_enabled, (native_pg_extensions_enabled | default('') | string | split(',')))
+            | map('trim') | reject('equalto','') | list
+          }}
+
+    - name: Ensure at least one PostgreSQL extension is specified
+      ansible.builtin.assert:
+        that:
+          - (pg_extensions_list | length > 0) or (native_pg_extensions_list | length > 0)
+        fail_msg: >
+          No PostgreSQL extensions defined. Provide at least one extension in
+          pg_extensions_enabled or native_pg_extensions_enabled.
+
+  tasks:
+    - name: Collect installed packages
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Collect service facts
+      ansible.builtin.service_facts:
+
+    - name: Detect PostgreSQL packages and services
+      ansible.builtin.set_fact:
+        pg_packages: >-
+          {{
+            ansible_facts.packages.keys()
+            | select('match', '^postgresql([0-9]+)?-server$')
+            | list
+          }}
+        pg_services: >-
+          {{
+            ansible_facts.services.keys()
+            | select('match', '^postgresql-([0-9]+)?.service$')
+            | list
+          }}
+
+    - name: Set pg exists flag
+      ansible.builtin.set_fact:
+        postgres_exist: "{{ (pg_packages | length > 0) or (pg_services | length > 0) }}"
+
+    - name: Abort if PostgreSQL not detected
+      ansible.builtin.meta: end_host
+      when: not postgres_exist
+
+    - name: Extract PostgreSQL major version from service name
+      ansible.builtin.set_fact:
+        postgres_number_version: >-
+          {{
+            (pg_services | first | default(''))
+            | regex_findall('([0-9]+)')
+            | first | default('')
+          }}
+
+    - name: Assert PostgreSQL version was detected
+      ansible.builtin.assert:
+        that:
+          - postgres_number_version | length > 0
+        fail_msg: >-
+          Could not extract PostgreSQL major version from service name.
+          pg_services found: {{ pg_services }}. Verify the service naming matches
+          'postgresql-<version>.service'.
+
+    - name: Derive PostgreSQL package base
+      ansible.builtin.set_fact:
+        postgres_pkg_base: >-
+          {{
+            'postgresql' ~ postgres_number_version
+            if (postgres_number_version | length > 0)
+            else 'postgresql'
+          }}
+
+    - name: Set OS major version
+      ansible.builtin.set_fact:
+        osmajorversion: "{{ ansible_facts['distribution_major_version'].strip().split('.')[0] | int }}"
+
+    - name: Show OS major version
+      ansible.builtin.debug:
+        msg: "OS major version is {{ osmajorversion }}"
+
+    - name: Build authorized repositories
+      ansible.builtin.set_fact:
+        repositories_authorized:
+          - "rhel-{{ osmajorversion }}-for-x86_64-baseos-rpms"
+          - "rhel-{{ osmajorversion }}-for-x86_64-appstream-rpms"
+          - "rhel-{{ osmajorversion }}-for-x86_64-supplementary-rpms"
+          - "satellite-client-6-for-rhel-{{ osmajorversion }}-x86_64-rpms"
+          - "{{ repo_custom_prefix }}_Extra_Packages_Enterprise_Linux_epel-rhel{{ osmajorversion }}"
+          - "codeready-builder-for-rhel-{{ osmajorversion }}-x86_64-rpms"
+          - "{{ repo_custom_prefix }}_PostgreSQL_pgdg-common-rhel{{ osmajorversion }}"
+          - "{{ repo_custom_prefix }}_PostgreSQL_pgdg-{{ postgres_number_version }}-rhel{{ osmajorversion }}"
+
+    - name: Check for PG module enabled
+      ansible.builtin.command: "dnf -q -C module list postgresql --enabled"
+      register: pg_mod_list
+      changed_when: false
+      failed_when: false
+      when: osmajorversion | int >= 8
+
+    - name: Disable PG AppStream module if enabled
+      ansible.builtin.command: "dnf -y module disable postgresql"
+      when: pg_mod_list.rc == 0
+      changed_when: pg_mod_list.rc == 0
+      failed_when: false
+
+    - name: Enable only authorized repos
+      community.general.rhsm_repository:
+        name: "{{ repositories_authorized }}"
+        purge: true
+
+    - name: Stop PostgreSQL before package update
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ pg_services }}"
+
+    - name: Build package list for enabled extensions
+      ansible.builtin.set_fact:
+        pg_extension_packages: >-
+          {{
+            pg_extensions_list
+            | map('extract', pg_extensions, 'packages')
+            | flatten
+          }}
+
+    - name: Install PostgreSQL core + enabled extension packages
+      ansible.builtin.package:
+        name: "{{ [postgres_pkg_base ~ '-server', postgres_pkg_base ~ '-contrib', 'python3-psycopg2'] + pg_extension_packages }}"
+        state: latest
+
+    - name: Start PostgreSQL again
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+      loop: "{{ pg_services }}"
+
+    - name: Auto-discover DBs (if auto mode)
+      ansible.builtin.command: >
+        su -l postgres -c
+        "psql -P tuples_only=on -c
+        'select datname from pg_database where datistemplate=false;'"
+      register: databases_list
+      changed_when: false
+      when: db_mode == "auto"
+
+    - name: Normalize database_names
+      ansible.builtin.set_fact:
+        database_names_list: >-
+          {{
+            (database_names | string | trim | regex_replace('\\s+', '') | split(','))
+            if (database_names is string)
+            else (database_names | default([]))
+          }}
+      when: db_mode == "named"
+
+    - name: Compute target database list
+      ansible.builtin.set_fact:
+        target_dbs: >-
+          {{
+            (
+              database_names_list
+              | reject('equalto', '')
+              | list
+            ) if db_mode == 'named'
+            else
+            (
+              databases_list.stdout_lines
+              | map('trim')
+              | reject('equalto', '')
+              | reject('match', db_exclude_regex)
+              | list
+            )
+          }}
+
+    - name: Extract SQL extension names
+      ansible.builtin.set_fact:
+        pg_extension_sql_names: >-
+          {{
+            pg_extensions_list
+            | map('extract', pg_extensions, 'sql_name')
+            | list
+          }}
+
+    - name: Extract native SQL extension names
+      ansible.builtin.set_fact:
+        native_pg_extension_sql_names: >-
+          {{
+            native_pg_extensions_list
+            | map('extract', native_pg_extensions, 'sql_name')
+            | list
+          }}
+
+    - name: Enable PostgreSQL extensions on each DB
+      ansible.builtin.command: >
+        su -l postgres -c
+        "psql -d {{ item.0 }} -c
+        'CREATE EXTENSION IF NOT EXISTS {{ item.1 }};'"
+      loop: "{{ target_dbs | product(pg_extension_sql_names + native_pg_extension_sql_names) | list }}"
+      changed_when: false
+
+    - name: Check extension versions
+      ansible.builtin.command: >
+        su -l postgres -c
+        "psql -d {{ item.0 }} -t -c
+        \"SELECT extname, extversion FROM pg_extension
+        WHERE extname = '{{ item.1 }}';\""
+      loop: "{{ target_dbs | product(pg_extension_sql_names + native_pg_extension_sql_names) | list }}"
+      changed_when: false
