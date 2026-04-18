@@ -1,0 +1,3 @@
+db_exclude_regex: "^(template0|template1|postgres)$" # default template exclusion
+repo_custom_prefix: "EXAMPLE" # prefix for org-managed EPEL and PGDG repos in Satellite
+validate_certs: true
