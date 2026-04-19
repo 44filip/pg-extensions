@@ -1,6 +1,6 @@
 # pg_extensions
 
-Installs and enables PostgreSQL extensions on RHEL hosts. Runs on demand via AWX.
+Modular Ansible playbook that installs and enables PostgreSQL extensions on RHEL hosts.
 
 ---
 
